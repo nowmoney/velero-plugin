@@ -14,6 +14,6 @@
 
 FROM debian:stretch-slim
 RUN mkdir /plugins
-ADD _output/velero-* /plugins/
+ADD velero-plugin-for-alibabacloud /plugins/
 USER nobody:nobody
 ENTRYPOINT ["/bin/bash", "-c", "cp /plugins/* /target/."]

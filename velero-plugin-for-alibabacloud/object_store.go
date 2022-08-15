@@ -33,12 +33,22 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
+	cryptorand "crypto/rand"
+	"golang.org/x/crypto/pbkdf2"
 )
 
 const (
 	OriginStr = "volumeId"
 	TargetStr = "VolumeId"
 	Workspace = "/tmp/velero-restore/"
+)
+
+var (
+	prefix = []byte("Salted__")
+	keySize = 32
 )
 
 type bucketGetter interface {
@@ -175,12 +185,17 @@ func (o *ObjectStore) PutObject(bucket, key string, body io.Reader) error {
 	if err != nil {
 		return err
 	}
+
+	encryptedBody, err := encrypt(body)
+	if err != nil {
+		return err
+	}
 	if o.encryptionKeyID != "" {
-		err = bucketObj.PutObject(key, body,
+		err = bucketObj.PutObject(key, encryptedBody,
 			oss.ServerSideEncryption("KMS"),
 			oss.ServerSideEncryptionKeyID(o.encryptionKeyID))
 	} else {
-		err = bucketObj.PutObject(key, body)
+		err = bucketObj.PutObject(key, encryptedBody)
 	}
 
 	return err
@@ -207,11 +222,15 @@ func (o *ObjectStore) GetObject(bucket, key string) (io.ReadCloser, error) {
 		if err != nil {
 			return nil, err
 		}
-
-		return CheckAndConvertVolumeId(body)
+		decrypted, err := decrypt(body)
+		if err != nil {
+			return nil, err
+		}
+		return CheckAndConvertVolumeId(decrypted)
 	}
 
-	return bucketObj.GetObject(key)
+	rc, err := bucketObj.GetObject(key)
+	return decrypt(rc)
 }
 
 // ListCommonPrefixes interface
@@ -520,4 +539,58 @@ func Compress(src, dst string) error {
 
 		return nil
 	})
+}
+
+func encrypt(data io.Reader) (io.Reader, error) {
+	password := []byte(os.Getenv("VELERO_AES_KEY"))
+
+	salt := make([]byte, 8)
+	if _, err := io.ReadFull(cryptorand.Reader, salt[:]); err != nil {
+		return nil, err
+	}
+	computed := pbkdf2.Key(password, salt, 10000, keySize + aes.BlockSize , sha256.New)
+	aesKey := computed[:keySize]
+	iv := computed[keySize:]
+
+	block, err := aes.NewCipher(aesKey)                                    
+	if err != nil {
+		return nil, err
+	}
+
+	header := append(prefix[:], salt...) 
+	var out bytes.Buffer
+	out.Write(header)
+
+	stream := cipher.NewOFB(block, iv)
+	sWriter := &cipher.StreamWriter{S: stream, W: &out}
+	if _, err := io.Copy(sWriter, data); err != nil {
+		return nil, err
+	}
+	return bytes.NewReader(out.Bytes()), nil
+}
+
+func decrypt(data io.Reader) (io.ReadCloser, error) {
+	password := []byte(os.Getenv("VELERO_AES_KEY"))
+
+	header := make([]byte, 16)
+	if _, err := data.Read(header); err != nil {
+		return nil, err
+	}
+	salt := header[8:]
+	computed := pbkdf2.Key(password, salt, 10000, keySize + aes.BlockSize , sha256.New)
+	aesKey := computed[:keySize]
+	iv := computed[keySize:]
+
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, err
+	}
+  
+	var out bytes.Buffer
+	stream := cipher.NewOFB(block, iv)
+	sReader := &cipher.StreamReader{S: stream, R: data}
+	if _, err := io.Copy(&out, sReader); err != nil {
+		return nil, err
+	}
+	return ioutil.NopCloser(bytes.NewReader(out.Bytes())), nil
 }
